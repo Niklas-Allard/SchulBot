@@ -21,13 +21,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 WORKDIR /app
 
 COPY composer.json composer.lock ./
-RUN composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+RUN composer install --no-dev --no-scripts --no-autoloader --prefer-dist --no-interaction
 
 COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY . .
 
+RUN composer dump-autoload --optimize
+RUN php artisan package:discover --ansi || true
 RUN php artisan wayfinder:generate --with-form || true
 RUN npm run build
 
