@@ -12,15 +12,7 @@ return new class extends Migration
             $table->id();
             $table->foreignId('user_id')->constrained()->cascadeOnDelete();
 
-            // IMAP
-            $table->string('imap_host');
-            $table->unsignedSmallInteger('imap_port')->default(993);
-            $table->string('imap_username');
-            $table->text('imap_password');
-            $table->string('imap_security', 16)->default('SSL');
-            $table->string('imap_mailbox')->default('INBOX');
-
-            // SMTP
+            // SMTP – jeder Nutzer antwortet von seiner eigenen Adresse
             $table->string('smtp_host');
             $table->unsignedSmallInteger('smtp_port')->default(465);
             $table->string('smtp_username');

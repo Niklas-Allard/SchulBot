@@ -1,0 +1,46 @@
+services:
+
+  web:
+    build:
+      context: ./web-SchulBot
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env.web
+    ports:
+      - "80:80"
+    volumes:
+      - web-data:/var/www/html/database
+      - web-storage:/var/www/html/storage/app
+    depends_on: []
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/up"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env.bot
+    volumes:
+      - bot-data:/app/data
+    depends_on:
+      web:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  web-data:
+  web-storage:
+  bot-data:

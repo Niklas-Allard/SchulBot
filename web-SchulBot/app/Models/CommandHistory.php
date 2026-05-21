@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class CommandHistory extends Model
 {
+    protected $table = 'command_history';
+
     public $timestamps = false;
 
     protected $fillable = [

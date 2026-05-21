@@ -14,15 +14,16 @@ import (
 	"schulbot/internal/commands"
 	"schulbot/internal/config"
 	"schulbot/internal/handlers/calendar"
-	"schulbot/internal/handlers/ki"
-	modelcmd "schulbot/internal/handlers/model"
 	"schulbot/internal/handlers/hilfe"
+	"schulbot/internal/handlers/ki"
 	"schulbot/internal/handlers/news"
-	"schulbot/internal/handlers/translate"
 	"schulbot/internal/handlers/sudoku"
 	"schulbot/internal/handlers/tasks"
+	"schulbot/internal/handlers/translate"
+	modelcmd "schulbot/internal/handlers/model"
 	"schulbot/internal/mail"
 	"schulbot/internal/store"
+	"schulbot/internal/users"
 )
 
 func main() {
@@ -43,6 +44,48 @@ func main() {
 	}
 	defer db.Close()
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Multi-user mode: one shared IMAP inbox, SMTP + AI resolved per sender
+	if cfg.LaravelAPIURL != "" {
+		if cfg.BotAPISecret == "" {
+			log.Error("LARAVEL_API_URL is set but BOT_API_SECRET is missing")
+			os.Exit(1)
+		}
+		manager := users.NewManager(cfg.LaravelAPIURL, cfg.BotAPISecret)
+
+		factory := func(aiProvider ai.Provider, d *store.Store) *commands.Dispatcher {
+			return commands.NewDispatcher(
+				ki.New(aiProvider, d, cfg.MaxPayloadChars, cfg.MaxResponseChars),
+				modelcmd.New(d, aiProvider.DefaultModel()),
+				sudoku.New(os.Getenv("SUDOKU_API_KEY"), d),
+				news.New(),
+				hilfe.New(),
+				translate.New(os.Getenv("LIBRETRANSLATE_URL"), os.Getenv("LIBRETRANSLATE_API_KEY")),
+				tasks.New(
+					os.Getenv("GOOGLE_CLIENT_ID"),
+					os.Getenv("GOOGLE_CLIENT_SECRET"),
+					os.Getenv("GOOGLE_REFRESH_TOKEN"),
+					os.Getenv("GOOGLE_TASKLIST_ID"),
+				),
+				calendar.New(
+					os.Getenv("GOOGLE_CLIENT_ID"),
+					os.Getenv("GOOGLE_CLIENT_SECRET"),
+					os.Getenv("GOOGLE_REFRESH_TOKEN"),
+					os.Getenv("GOOGLE_CALENDAR_ID"),
+				),
+			)
+		}
+
+		if err := app.RunMultiUser(ctx, cfg, manager, factory, db, log); err != nil {
+			log.Error("multi-user runner error", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Single-user mode (legacy): use IMAP/SMTP/AI env vars directly
 	aiProvider, err := ai.NewProvider(cfg.AI.Provider, cfg.AI.APIURL, cfg.AI.APIKey, cfg.AI.Model)
 	if err != nil {
 		log.Error("AI provider init failed", "err", err)
@@ -83,10 +126,6 @@ func main() {
 	)
 
 	application := app.New(cfg, imapClient, smtpClient, dispatcher, db, log)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	if err := application.Run(ctx); err != nil {
 		log.Error("application error", "err", err)
 		os.Exit(1)

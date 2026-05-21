@@ -10,18 +10,16 @@ class BotConfig extends Model
 {
     protected $fillable = [
         'user_id',
-        'imap_host', 'imap_port', 'imap_username', 'imap_password', 'imap_security', 'imap_mailbox',
         'smtp_host', 'smtp_port', 'smtp_username', 'smtp_password', 'smtp_security', 'smtp_from_name', 'smtp_from_address',
         'ai_provider', 'ai_api_url', 'ai_api_key', 'ai_model',
         'is_active',
     ];
 
-    protected $hidden = ['imap_password', 'smtp_password', 'ai_api_key'];
+    protected $hidden = ['smtp_password', 'ai_api_key'];
 
     protected function casts(): array
     {
         return [
-            'imap_port' => 'integer',
             'smtp_port' => 'integer',
             'is_active' => 'boolean',
         ];
@@ -32,11 +30,6 @@ class BotConfig extends Model
         return $this->belongsTo(User::class);
     }
 
-    public function setImapPasswordAttribute(string $value): void
-    {
-        $this->attributes['imap_password'] = Crypt::encryptString($value);
-    }
-
     public function setSmtpPasswordAttribute(string $value): void
     {
         $this->attributes['smtp_password'] = Crypt::encryptString($value);
@@ -45,11 +38,6 @@ class BotConfig extends Model
     public function setAiApiKeyAttribute(?string $value): void
     {
         $this->attributes['ai_api_key'] = $value ? Crypt::encryptString($value) : null;
-    }
-
-    public function getImapPasswordDecrypted(): string
-    {
-        return Crypt::decryptString($this->attributes['imap_password']);
     }
 
     public function getSmtpPasswordDecrypted(): string

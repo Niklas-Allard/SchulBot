@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { Link } from '@inertiajs/vue3';
-import { BookOpen, FolderGit2, LayoutGrid } from 'lucide-vue-next';
+import { Link, usePage } from '@inertiajs/vue3';
+import { BookOpen, Clock, LayoutGrid, Shield, Wrench } from 'lucide-vue-next';
+import { computed } from 'vue';
 import AppLogo from '@/components/AppLogo.vue';
 import NavFooter from '@/components/NavFooter.vue';
 import NavMain from '@/components/NavMain.vue';
@@ -17,25 +18,21 @@ import {
 import { dashboard } from '@/routes';
 import type { NavItem } from '@/types';
 
+const page = usePage();
+const isAdmin = computed(() => (page.props.auth.user as any)?.role === 'admin');
+
 const mainNavItems: NavItem[] = [
-    {
-        title: 'Dashboard',
-        href: dashboard(),
-        icon: LayoutGrid,
-    },
+    { title: 'Dashboard',    href: dashboard(),      icon: LayoutGrid },
+    { title: 'Bot einrichten', href: '/bot/setup',   icon: Wrench },
+    { title: 'Verlauf',      href: '/bot/history',   icon: Clock },
 ];
 
+const adminNavItems = computed<NavItem[]>(() =>
+    isAdmin.value ? [{ title: 'Admin', href: '/admin/users', icon: Shield }] : [],
+);
+
 const footerNavItems: NavItem[] = [
-    {
-        title: 'Repository',
-        href: 'https://github.com/laravel/vue-starter-kit',
-        icon: FolderGit2,
-    },
-    {
-        title: 'Documentation',
-        href: 'https://laravel.com/docs/starter-kits#vue',
-        icon: BookOpen,
-    },
+    { title: 'Einrichtungs-Guide', href: '/guide', icon: BookOpen },
 ];
 </script>
 
@@ -55,6 +52,7 @@ const footerNavItems: NavItem[] = [
 
         <SidebarContent>
             <NavMain :items="mainNavItems" />
+            <NavMain v-if="adminNavItems.length" :items="adminNavItems" />
         </SidebarContent>
 
         <SidebarFooter>

@@ -1,27 +1,45 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
+	"schulbot/internal/ai"
 	"schulbot/internal/commands"
 	"schulbot/internal/config"
 	imail "schulbot/internal/mail"
 	"schulbot/internal/model"
 	"schulbot/internal/parser"
 	"schulbot/internal/store"
+	"schulbot/internal/users"
 )
+
+// DispatcherFactory creates a handler dispatcher for a given AI provider and store.
+type DispatcherFactory func(aiProvider ai.Provider, db *store.Store) *commands.Dispatcher
+
+// UserLookup resolves a sender email to their SMTP + AI config.
+type UserLookup interface {
+	FindByEmail(ctx context.Context, email string) (*users.UserConfig, error)
+}
 
 type App struct {
 	cfg        *config.Config
 	imap       *imail.IMAPClient
-	smtp       *imail.SMTPClient
-	dispatcher *commands.Dispatcher
+	smtp       *imail.SMTPClient  // nil in multi-user mode (resolved per message)
+	dispatcher *commands.Dispatcher // nil in multi-user mode (built per message)
 	store      *store.Store
 	log        *slog.Logger
+	keyScope   string
+	httpClient *http.Client
+	// Multi-user fields (nil in single-user mode)
+	userLookup        UserLookup
+	dispatcherFactory DispatcherFactory
 }
 
 func New(
@@ -32,7 +50,59 @@ func New(
 	store *store.Store,
 	log *slog.Logger,
 ) *App {
-	return &App{cfg: cfg, imap: imap, smtp: smtp, dispatcher: dispatcher, store: store, log: log}
+	return &App{
+		cfg:        cfg,
+		imap:       imap,
+		smtp:       smtp,
+		dispatcher: dispatcher,
+		store:      store,
+		log:        log,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// NewMultiUser creates an App for the shared-inbox multi-user mode.
+// SMTP and AI are resolved per message via userLookup + dispatcherFactory.
+func NewMultiUser(
+	cfg *config.Config,
+	imap *imail.IMAPClient,
+	store *store.Store,
+	lookup UserLookup,
+	factory DispatcherFactory,
+	log *slog.Logger,
+) *App {
+	return &App{
+		cfg:               cfg,
+		imap:              imap,
+		store:             store,
+		log:               log,
+		httpClient:        &http.Client{Timeout: 10 * time.Second},
+		userLookup:        lookup,
+		dispatcherFactory: factory,
+	}
+}
+
+// NewScoped creates an App whose BoltDB keys are prefixed with the user email,
+// preventing collisions between users in multi-user mode.
+func NewScoped(
+	cfg *config.Config,
+	imap *imail.IMAPClient,
+	smtp *imail.SMTPClient,
+	dispatcher *commands.Dispatcher,
+	store *store.Store,
+	log *slog.Logger,
+	userEmail string,
+) *App {
+	return &App{
+		cfg:        cfg,
+		imap:       imap,
+		smtp:       smtp,
+		dispatcher: dispatcher,
+		store:      store,
+		log:        log,
+		keyScope:   "user:" + userEmail + ":",
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
 }
 
 // Run blocks, polling for new messages on every tick, until ctx is cancelled.
@@ -105,7 +175,8 @@ func (a *App) processMessage(ctx context.Context, msg imail.Message) bool {
 	}
 
 	// ── Duplicate guard ───────────────────────────────────────────────────────
-	processed, err := a.store.IsProcessed(msg.ID)
+	storeKey := a.keyScope + msg.ID
+	processed, err := a.store.IsProcessed(storeKey)
 	if err != nil {
 		log.Error("store check failed", "err", err)
 		return false
@@ -119,12 +190,40 @@ func (a *App) processMessage(ctx context.Context, msg imail.Message) bool {
 	cmd, ok := parser.Parse(msg.Subject, msg.Body)
 	if !ok {
 		log.Info("no command tag found, skipping")
-		_ = a.store.MarkProcessed(msg.ID) // don't fetch again
+		_ = a.store.MarkProcessed(storeKey) // don't fetch again
 		return true
 	}
 
 	log = log.With("tag", cmd.Tag, "payload_len", len(cmd.Payload))
 	log.Info("command detected")
+
+	// ── Multi-user: resolve sender's SMTP + AI from web dashboard ────────────
+	smtpClient := a.smtp
+	dispatcher := a.dispatcher
+	if a.userLookup != nil {
+		uc, err := a.userLookup.FindByEmail(ctx, msg.From)
+		if err != nil {
+			log.Error("user lookup failed", "err", err)
+			return false
+		}
+		if uc == nil {
+			log.Info("sender not registered in dashboard, skipping")
+			_ = a.store.MarkProcessed(storeKey)
+			return true
+		}
+		aiProvider, err := ai.NewProvider(uc.AIProvider, uc.AIAPIURL, uc.AIAPIKey, uc.AIModel)
+		if err != nil {
+			log.Error("AI provider init failed", "err", err)
+			return false
+		}
+		smtpClient = imail.NewSMTPClient(
+			uc.SMTPHost, uc.SMTPPort,
+			uc.SMTPUsername, uc.SMTPPassword,
+			uc.SMTPFromName, uc.SMTPFromAddress,
+			uc.SMTPSecurity,
+		)
+		dispatcher = a.dispatcherFactory(aiProvider, a.store)
+	}
 
 	// ── Dispatch ──────────────────────────────────────────────────────────────
 	replyAddr := msg.From
@@ -142,20 +241,21 @@ func (a *App) processMessage(ctx context.Context, msg imail.Message) bool {
 		ReceivedAt: msg.Date,
 	}
 
-	resp, dispErr := a.dispatcher.Dispatch(ctx, req)
+	resp, dispErr := dispatcher.Dispatch(ctx, req)
 	if dispErr != nil {
 		log.Error("dispatch failed", "err", dispErr)
-		a.sendErrorReply(replyAddr, msg.Subject, dispErr)
-		_ = a.store.MarkProcessed(msg.ID)
+		a.sendErrorReply(smtpClient, replyAddr, msg.Subject, dispErr)
+		_ = a.store.MarkProcessed(storeKey)
+		a.writeHistory(req.From, cmd.Tag, cmd.Payload, dispErr.Error(), "error")
 		return true
 	}
 
 	// ── Send reply ────────────────────────────────────────────────────────────
 	var sendErr error
 	if len(resp.Attachments) > 0 {
-		sendErr = a.smtp.SendWithAttachments(replyAddr, resp.ReplySubject, resp.ReplyBody, resp.Attachments)
+		sendErr = smtpClient.SendWithAttachments(replyAddr, resp.ReplySubject, resp.ReplyBody, resp.Attachments)
 	} else {
-		sendErr = a.smtp.Send(replyAddr, resp.ReplySubject, resp.ReplyBody)
+		sendErr = smtpClient.Send(replyAddr, resp.ReplySubject, resp.ReplyBody)
 	}
 	if err := sendErr; err != nil {
 		if imail.IsPermanentSMTP(err) {
@@ -167,21 +267,59 @@ func (a *App) processMessage(ctx context.Context, msg imail.Message) bool {
 		return false
 	}
 
-	if err := a.store.MarkProcessed(msg.ID); err != nil {
+	if err := a.store.MarkProcessed(storeKey); err != nil {
 		log.Error("store mark failed", "err", err)
 	}
 
+	a.writeHistory(req.From, cmd.Tag, cmd.Payload, resp.ReplyBody, "ok")
 	log.Info("replied successfully")
 	return true
 }
 
-func (a *App) sendErrorReply(to, subject string, origErr error) {
+func (a *App) sendErrorReply(smtp *imail.SMTPClient, to, subject string, origErr error) {
+	if smtp == nil {
+		return
+	}
 	body := fmt.Sprintf(
 		"Leider ist ein Fehler aufgetreten:\n\n%v\n\nBitte versuche es später erneut oder wende dich an den Administrator.",
 		origErr,
 	)
-	if err := a.smtp.Send(to, "Re: "+subject+" [Fehler]", body); err != nil {
+	if err := smtp.Send(to, "Re: "+subject+" [Fehler]", body); err != nil {
 		a.log.Error("could not send error reply", "to", to, "err", err)
+	}
+}
+
+// writeHistory posts a processed command to the Laravel web app for display in the dashboard.
+// It is best-effort: failures are logged but never block message processing.
+func (a *App) writeHistory(senderEmail, tag, payload, response, status string) {
+	if a.cfg.LaravelAPIURL == "" || a.cfg.BotAPISecret == "" {
+		return
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"sender_email": senderEmail,
+		"tag":          tag,
+		"payload":      payload,
+		"response":     response,
+		"status":       status,
+	})
+
+	req, err := http.NewRequest(http.MethodPost, a.cfg.LaravelAPIURL+"/api/internal/history", bytes.NewReader(body))
+	if err != nil {
+		a.log.Warn("history: failed to build request", "err", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bot-Secret", a.cfg.BotAPISecret)
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.log.Warn("history: post failed", "err", err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		a.log.Warn("history: unexpected status", "code", resp.StatusCode)
 	}
 }
 
