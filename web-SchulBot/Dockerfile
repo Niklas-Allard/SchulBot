@@ -1,30 +1,38 @@
-# ── Stage 1: Build Vue/Inertia assets ─────────────────────────────────────────
-FROM node:22-alpine AS node-builder
+# ── Stage 1: Build app + assets ───────────────────────────────────────────────
+FROM php:8.4-apache AS build
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        unzip \
+        libsqlite3-dev \
+        libzip-dev \
+    && docker-php-ext-install pdo pdo_sqlite zip opcache \
+    && a2enmod rewrite headers \
+    && rm -rf /var/lib/apt/lists/*
 
-# Nur Dependency-Dateien zuerst kopieren für besseres Docker-Caching
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# Restlichen Code kopieren und Assets bauen
-COPY . .
-RUN npm run build
-
-
-# ── Stage 2: PHP dependencies ─────────────────────────────────────────────────
-FROM composer:2 AS composer-builder
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY composer.json composer.lock ./
-RUN composer install --no-dev --no-scripts --prefer-dist --optimize-autoloader
+RUN composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
-RUN composer run-script post-autoload-dump 2>/dev/null || true
+
+RUN php artisan wayfinder:generate --with-form || true
+RUN npm run build
 
 
-# ── Stage 3: Runtime (PHP 8.4 + Apache) ───────────────────────────────────────
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM php:8.4-apache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -40,9 +48,7 @@ RUN sed -i 's|/var/www/html|/var/www/html/public|g' /etc/apache2/sites-available
 
 WORKDIR /var/www/html
 
-COPY --from=composer-builder /app/vendor ./vendor
-COPY --from=node-builder /app/public/build ./public/build
-COPY . .
+COPY --from=build /app /var/www/html
 
 RUN mkdir -p storage/framework/sessions storage/framework/views storage/framework/cache bootstrap/cache database \
     && chown -R www-data:www-data storage bootstrap/cache database \
