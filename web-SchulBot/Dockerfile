@@ -3,13 +3,13 @@ FROM node:22-alpine AS node-builder
 
 WORKDIR /app
 
-RUN npm install -g pnpm
+RUN npm install -g npm
 
-COPY package.json pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+COPY package.json npm-workspace.yaml ./
+RUN npm install --frozen-lockfile
 
 COPY . .
-RUN pnpm run build
+RUN npm run build
 
 # ── Stage 2: PHP dependencies ─────────────────────────────────────────────────
 FROM composer:2 AS composer-builder
